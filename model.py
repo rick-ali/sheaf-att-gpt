@@ -41,11 +41,14 @@ class CausalSelfAttention(nn.Module):
         self.n_head = config.n_head
         self.n_embd = config.n_embd
         self.dropout = config.dropout
+        self.use_sheaf_mixing = config.use_sheaf_mixing
+        self.sheaf_chunk_size = config.sheaf_chunk_size
         # flash attention make GPU go brrrrr but support is only in PyTorch >= 2.0
         self.flash = hasattr(torch.nn.functional, 'scaled_dot_product_attention')
         if not self.flash:
             print("WARNING: using slow attention. Flash Attention requires PyTorch >= 2.0")
-            # causal mask to ensure that attention is only applied to the left in the input sequence
+        # causal mask: needed for manual attention path or sheaf mixing path
+        if not self.flash or self.use_sheaf_mixing:
             self.register_buffer("bias", torch.tril(torch.ones(config.block_size, config.block_size))
                                         .view(1, 1, config.block_size, config.block_size))
 
@@ -59,9 +62,13 @@ class CausalSelfAttention(nn.Module):
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
 
         # causal self-attention; Self-attend: (B, nh, T, hs) x (B, nh, hs, T) -> (B, nh, T, T)
-        if self.flash:
+        if self.use_sheaf_mixing:
+            # sheaf-inspired cross-head mixing attention (pure PyTorch)
+            y = self._sheaf_attention(q, k, v)
+        elif self.flash:
             # efficient attention using Flash Attention CUDA kernels
             y = torch.nn.functional.scaled_dot_product_attention(q, k, v, attn_mask=None, dropout_p=self.dropout if self.training else 0, is_causal=True)
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
         else:
             # manual implementation of attention
             att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
@@ -69,11 +76,97 @@ class CausalSelfAttention(nn.Module):
             att = F.softmax(att, dim=-1)
             att = self.attn_dropout(att)
             y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
-        y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
+            y = y.transpose(1, 2).contiguous().view(B, T, C)
 
         # output projection
         y = self.resid_dropout(self.c_proj(y))
         return y
+
+    def _sheaf_attention(self, q, k, v):
+        """Sheaf-inspired cross-head mixing attention (batched, no Python loop).
+
+        For each query head h, computes:
+          alpha[t,s,h] = softmax_s(Q[t,h]·K[s,h] / sqrt(D) + causal_mask)  -- time envelope
+          beta[t,s,h,g] = softmax_g(Q[t,h]·K[s,g] / sqrt(D))              -- head mixing
+          Y[t,h] = sum_s alpha[t,s,h] * sum_g beta[t,s,h,g] * V[s,g]      -- aggregation
+
+        Phase 1 (alpha) is standard causal attention computed for all heads at once.
+        Phase 2 (beta/W/Y) processes C query heads per chunk. When C<H, each chunk
+        is wrapped in torch.utils.checkpoint during training so that intermediates
+        (P, beta, W) are not saved by autograd — they are recomputed during backward.
+        """
+        B, H, T, D = q.shape
+        scale = 1.0 / math.sqrt(D)
+        causal_mask = self.bias[:, :, :T, :T]  # (1, 1, T, T)
+
+        # Phase 1: alpha — standard causal attention (all heads, batched)
+        alpha_logits = (q @ k.transpose(-2, -1)) * scale  # (B, H, T, T)
+        alpha_logits = alpha_logits.masked_fill(causal_mask == 0, float('-inf'))
+        alpha = F.softmax(alpha_logits, dim=-1)  # (B, H, T, T)
+        alpha = self.attn_dropout(alpha)
+
+        # Phase 2: cross-head mixing
+        C = H if self.sheaf_chunk_size <= 0 else min(self.sheaf_chunk_size, H)
+        use_checkpoint = C < H and self.training
+
+        def _chunk_fn(q_c, alpha_c, k, v, scale_t):
+            """Compute cross-head mixing for a chunk of query heads."""
+            P_c = torch.einsum('bhtd,bgsd->bhgts', q_c, k) * scale_t
+            beta_c = F.softmax(P_c, dim=2)  # softmax over g
+            W_c = torch.einsum('bhgts,bgsd->bhtsd', beta_c, v)
+            y_c = torch.einsum('bhts,bhtsd->bhtd', alpha_c, W_c)
+            return y_c
+
+        scale_t = torch.tensor(scale, device=q.device, dtype=q.dtype)
+
+        if C == H:
+            # Single pass, no loop, no checkpointing — maximum speed
+            y = _chunk_fn(q, alpha, k, v, scale_t)
+        else:
+            # Chunked with gradient checkpointing during training
+            y_parts = []
+            for c_start in range(0, H, C):
+                c_end = min(c_start + C, H)
+                q_c = q[:, c_start:c_end]
+                alpha_c = alpha[:, c_start:c_end]
+                if use_checkpoint:
+                    y_c = torch.utils.checkpoint.checkpoint(
+                        _chunk_fn, q_c, alpha_c, k, v, scale_t,
+                        use_reentrant=False,
+                    )
+                else:
+                    y_c = _chunk_fn(q_c, alpha_c, k, v, scale_t)
+                y_parts.append(y_c)
+            y = torch.cat(y_parts, dim=1)
+
+        return y.transpose(1, 2).contiguous().view(B, T, H * D)
+
+    def _sheaf_attention_loop(self, q, k, v):
+        """Reference loop implementation of sheaf attention (kept for testing)."""
+        B, H, T, D = q.shape
+        scale = 1.0 / math.sqrt(D)
+        causal_mask = self.bias[:, :, :T, :T]  # (1, 1, T, T)
+
+        outputs = []
+        for h in range(H):
+            q_h = q[:, h]  # (B, T, D)
+            P_h = torch.einsum('btd,bgsd->bgts', q_h, k)  # (B, H, T, T)
+
+            alpha_logits = P_h[:, h, :, :] * scale  # (B, T, T)
+            alpha_logits = alpha_logits.masked_fill(
+                causal_mask.squeeze(0).squeeze(0) == 0, float('-inf')
+            )
+            alpha = F.softmax(alpha_logits, dim=-1)
+            alpha = self.attn_dropout(alpha)
+
+            beta = F.softmax(P_h * scale, dim=1)  # (B, H, T, T)
+
+            W = torch.einsum('bgts,bgsd->btsd', beta, v)  # (B, T, T, D)
+            y_h = torch.einsum('bts,btsd->btd', alpha, W)  # (B, T, D)
+            outputs.append(y_h)
+
+        y = torch.stack(outputs, dim=1)  # (B, H, T, D)
+        return y.transpose(1, 2).contiguous().view(B, T, H * D)
 
 class MLP(nn.Module):
 
@@ -114,6 +207,8 @@ class GPTConfig:
     n_embd: int = 768
     dropout: float = 0.0
     bias: bool = True # True: bias in Linears and LayerNorms, like GPT-2. False: a bit better and faster
+    use_sheaf_mixing: bool = False # True: enable sheaf-inspired cross-head mixing attention
+    sheaf_chunk_size: int = 0 # 0: all heads at once; >0: chunk size for memory-efficient sheaf attention
 
 class GPT(nn.Module):
 
