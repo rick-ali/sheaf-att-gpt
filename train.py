@@ -222,12 +222,22 @@ def estimate_loss():
     model.eval()
     for split in ['train', 'val']:
         losses = torch.zeros(eval_iters)
+        target_hits = 0
+        target_total = 0
         for k in range(eval_iters):
             X, Y = get_batch(split)
             with ctx:
                 logits, loss = model(X, Y)
             losses[k] = loss.item()
+            # synthetic binding: track accuracy on Target tokens only
+            if dataset == 'synthetic_binding':
+                preds = logits.argmax(dim=-1)  # (B, T)
+                target_mask = (Y >= 20)
+                target_total += target_mask.sum().item()
+                target_hits += ((preds == Y) & target_mask).sum().item()
         out[split] = losses.mean()
+        if dataset == 'synthetic_binding' and target_total > 0:
+            out[split + '_target_acc'] = 100.0 * target_hits / target_total
     model.train()
     return out
 
@@ -266,15 +276,22 @@ while True:
     # evaluate the loss on train/val sets and write checkpoints
     if iter_num % eval_interval == 0 and master_process:
         losses = estimate_loss()
-        print(f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}")
+        log_msg = f"step {iter_num}: train loss {losses['train']:.4f}, val loss {losses['val']:.4f}"
+        if 'val_target_acc' in losses:
+            log_msg += f", train target acc {losses['train_target_acc']:.2f}%, val target acc {losses['val_target_acc']:.2f}%"
+        print(log_msg)
         if wandb_log:
-            wandb.log({
+            wb = {
                 "iter": iter_num,
                 "train/loss": losses['train'],
                 "val/loss": losses['val'],
                 "lr": lr,
                 "mfu": running_mfu*100, # convert to percentage
-            }, step=iter_num)
+            }
+            if 'val_target_acc' in losses:
+                wb["train/target_acc"] = losses['train_target_acc']
+                wb["val/target_acc"] = losses['val_target_acc']
+            wandb.log(wb, step=iter_num)
         if losses['val'] < best_val_loss or always_save_checkpoint:
             best_val_loss = losses['val']
             if iter_num > 0:

@@ -12,3 +12,4 @@ env/
 venv/
 .venv/
 wandb/
+.claude/
